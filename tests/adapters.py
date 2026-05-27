@@ -41,14 +41,20 @@ class DDP(nn.Module):
         for param in module.parameters():
             dist.broadcast(param.data, src=0)
 
-        for param in module.parameters():
-            if param.requires_grad:
-                param.register_post_accumulate_grad_hook(self._sync_grad)
+        self.params = [p for p in module.parameters() if p.requires_grad]
+        self.params[0].register_post_accumulate_grad_hook(self._sync_all_grads)
 
-    def _sync_grad(self, param):
-        sz = dist.get_world_size()
-        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-        param.grad /= sz
+    def _sync_all_grads(self, param):
+        grads = [p.grad for p in self.params]
+
+        flat = torch._utils._flatten_dense_tensors(grads)
+
+        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+        flat /= dist.get_world_size()
+
+        for param, new_grad in zip(self.params, torch._utils._unflatten_dense_tensors(flat, grads)):
+            param.grad.copy_(new_grad)
+
 
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
