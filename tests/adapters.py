@@ -3,7 +3,9 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-
+from torch.optim import Optimizer
+import math
+from typing import Any
 
 
 def get_flashattention_autograd_function_pytorch() -> type:
@@ -140,6 +142,38 @@ def fsdp_gather_full_params(fsdp_model: torch.nn.Module) -> dict[str, torch.Tens
     """
     raise NotImplementedError
 
+class ShardedOptimizer(Optimizer):
+    def __init__(self, params, optimizer_cls: type[Optimizer], **kwargs: Any) -> None:
+        self._optimizer_cls = optimizer_cls
+        self._optimizer_kwargs = kwargs
+        self._rank = dist.get_rank()
+        self._world_size = dist.get_world_size()
+        self._all_params: list[torch.Tensor] = []
+        super().__init__(params, {})
+
+    def _shard_size(self) -> int:
+        return math.ceil(len(self._all_params) / self._world_size)
+
+    def _owner_rank(self, param_idx: int) -> int:
+        return min(param_idx // self._shard_size(), self._world_size - 1)
+
+    def add_param_group(self, param_group: dict[str, Any]) -> None:
+        params = list(param_group.get("params", []))
+        super().add_param_group(param_group)
+        self._all_params.extend(params)
+
+        my_params = [
+            p for i, p in enumerate(self._all_params)
+            if self._owner_rank(i) == self._rank
+        ]
+        self._inner = self._optimizer_cls([{"params": my_params}], **self._optimizer_kwargs)
+
+    def step(self, closure=None, **kwargs):
+        loss = self._inner.step(closure, **kwargs)
+        for i, p in enumerate(self._all_params):
+            dist.broadcast(p.data, src=self._owner_rank(i))
+        return loss
+
 
 def get_sharded_optimizer(params, optimizer_cls: type[torch.optim.Optimizer], **kwargs) -> torch.optim.Optimizer:
     """
@@ -157,4 +191,4 @@ def get_sharded_optimizer(params, optimizer_cls: type[torch.optim.Optimizer], **
     Returns:
         Instance of sharded optimizer.
     """
-    raise NotImplementedError
+    return ShardedOptimizer(params, optimizer_cls, **kwargs)
