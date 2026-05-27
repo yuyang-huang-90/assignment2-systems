@@ -38,23 +38,23 @@ class DDP(nn.Module):
     def __init__(self, module: nn.Module):
         super().__init__()
         self.module = module
+        self.handles = []
         for param in module.parameters():
             dist.broadcast(param.data, src=0)
 
-        self.params = [p for p in module.parameters() if p.requires_grad]
-        self.params[0].register_post_accumulate_grad_hook(self._sync_all_grads)
+        for param in module.parameters():
+            if param.requires_grad:
+                param.register_post_accumulate_grad_hook(self._sync_all_grads)
 
     def _sync_all_grads(self, param):
-        grads = [p.grad for p in self.params]
+        param.grad /= dist.get_world_size()
+        handle = dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, async_op=True)
+        self.handles.append(handle)
 
-        flat = torch._utils._flatten_dense_tensors(grads)
-
-        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-        flat /= dist.get_world_size()
-
-        for param, new_grad in zip(self.params, torch._utils._unflatten_dense_tensors(flat, grads)):
-            param.grad.copy_(new_grad)
-
+    def finish_gradient_synchronization(self):
+        for handle in self.handles:
+            handle.wait()
+        self.handles.clear()
 
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
@@ -90,8 +90,7 @@ def ddp_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Opt
         optimizer: torch.optim.Optimizer
             Optimizer being used with the DDP-wrapped model.
     """
-    # For example: ddp_model.finish_gradient_synchronization()
-    pass
+    ddp_model.finish_gradient_synchronization()
 
 
 def get_fsdp(module: torch.nn.Module, compute_dtype: torch.dtype | None = None) -> torch.nn.Module:
