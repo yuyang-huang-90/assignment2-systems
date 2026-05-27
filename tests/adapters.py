@@ -6,6 +6,9 @@ import torch.distributed as dist
 from torch.optim import Optimizer
 import math
 from typing import Any
+import torch.nn.functional as F
+
+from cs336_basics.model import Embedding, Linear
 
 
 def get_flashattention_autograd_function_pytorch() -> type:
@@ -94,6 +97,94 @@ def ddp_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Opt
     """
     ddp_model.finish_gradient_synchronization()
 
+class AllGatherWeight(torch.autograd.Function):
+    """Gather row-sharded weights in forward; reduce-scatter their grads in backward."""
+
+    @staticmethod
+    def forward(ctx, shard: torch.Tensor, full_rows: int, master_dtype: torch.dtype) -> torch.Tensor:
+        ctx.full_rows = full_rows
+        ctx.master_dtype = master_dtype  # always fp32
+        world_size = dist.get_world_size()
+        shard_size = math.ceil(full_rows / world_size)
+
+        pad_rows = shard_size - shard.shape[0]
+        padded = F.pad(shard, (0, 0, 0, pad_rows)) if pad_rows > 0 else shard
+        chunks = [torch.empty_like(padded) for _ in range(world_size)]
+        dist.all_gather(chunks, padded.contiguous())
+        return torch.cat(chunks, dim=0)[:full_rows]
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        world_size = dist.get_world_size()
+        shard_size = math.ceil(ctx.full_rows / world_size)
+
+        grad = grad.to(ctx.master_dtype)
+
+        pad_rows = world_size * shard_size - ctx.full_rows
+        padded = F.pad(grad, (0, 0, 0, pad_rows)) if pad_rows > 0 else grad
+        grad_shard = torch.empty(shard_size, *grad.shape[1:], dtype=grad.dtype, device=grad.device)
+        dist.reduce_scatter(grad_shard, list(padded.chunk(world_size, dim=0)))
+        grad_shard /= world_size
+        return grad_shard, None, None
+
+
+def _shard_weight(layer: nn.Module, compute_dtype: torch.dtype | None) -> tuple[nn.Parameter, int, torch.dtype | None]:
+    full_rows = layer.weight.shape[0]
+    shard_size = math.ceil(full_rows / dist.get_world_size())
+    start = dist.get_rank() * shard_size
+    end = min(start + shard_size, full_rows)
+    shard = nn.Parameter(layer.weight.data[start:end].clone())
+    return shard, full_rows, compute_dtype
+
+
+class ShardedLinear(Linear):
+    def __init__(self, layer: Linear, compute_dtype: torch.dtype | None):
+        nn.Module.__init__(self)
+        self.weight, self.full_rows, self.compute_dtype = _shard_weight(layer, compute_dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = self.weight.to(self.compute_dtype) if self.compute_dtype else self.weight
+        full_weight = AllGatherWeight.apply(weight, self.full_rows, self.weight.dtype)
+        return F.linear(x, full_weight)
+
+
+class ShardedEmbedding(Embedding):
+    def __init__(self, layer: Embedding, compute_dtype: torch.dtype | None):
+        nn.Module.__init__(self)
+        self.weight, self.full_rows, self.compute_dtype = _shard_weight(layer, compute_dtype)
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        weight = self.weight.to(self.compute_dtype) if self.compute_dtype else self.weight
+        full_weight = AllGatherWeight.apply(weight, self.full_rows, self.weight.dtype)
+        return full_weight[token_ids]
+
+
+class FSDP(nn.Module):
+    def __init__(self, module: nn.Module, compute_dtype: torch.dtype | None = None):
+        super().__init__()
+        self.module = module
+        self._replace_with_fsdp_layers(module, compute_dtype)
+
+    def forward(self, *inputs, **kwargs):
+        return self.module(*inputs, **kwargs)
+    
+    def _replace_with_fsdp_layers(self, module: nn.Module, compute_dtype: torch.dtype | None) -> None:
+        for name, child in module.named_children():
+            if isinstance(child, Linear):
+                setattr(module, name, ShardedLinear(child, compute_dtype))
+            elif isinstance(child, Embedding):
+                setattr(module, name, ShardedEmbedding(child, compute_dtype))
+            else:
+                self._replace_with_fsdp_layers(child, compute_dtype)
+    
+    def finish_gradient_synchronization(self):
+        for module in self.module.modules():
+            if isinstance(module, (ShardedLinear, ShardedEmbedding)):
+                continue
+            for param in module.parameters(recurse=False):
+                if param.grad is not None:
+                    dist.all_reduce(param.grad)
+                    param.grad /= dist.get_world_size()
 
 def get_fsdp(module: torch.nn.Module, compute_dtype: torch.dtype | None = None) -> torch.nn.Module:
     """
@@ -110,8 +201,7 @@ def get_fsdp(module: torch.nn.Module, compute_dtype: torch.dtype | None = None) 
     Returns:
         Instance of an FSDP class.
     """
-    # For example: return FSDP(module, compute_dtype=compute_dtype)
-    raise NotImplementedError
+    return FSDP(module, compute_dtype=compute_dtype)
 
 
 def fsdp_on_after_backward(fsdp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -125,9 +215,7 @@ def fsdp_on_after_backward(fsdp_model: torch.nn.Module, optimizer: torch.optim.O
         optimizer: torch.optim.Optimizer
             Optimizer being used with the FSDP-wrapped model.
     """
-    # For example: fsdp_model.finish_gradient_synchronization()
-    raise NotImplementedError
-
+    fsdp_model.finish_gradient_synchronization()
 
 def fsdp_gather_full_params(fsdp_model: torch.nn.Module) -> dict[str, torch.Tensor]:
     """
@@ -140,7 +228,17 @@ def fsdp_gather_full_params(fsdp_model: torch.nn.Module) -> dict[str, torch.Tens
     Returns:
         State dictionary mapping parameter names to full (unsharded) tensors.
     """
-    raise NotImplementedError
+    state_dict = {}
+    for name, module in fsdp_model.module.named_modules():
+        if isinstance(module, (ShardedLinear, ShardedEmbedding)):
+            prefix = (name + '.') if name else ''
+            state_dict[prefix + 'weight'] = AllGatherWeight.apply(
+                module.weight.data, module.full_rows, module.weight.dtype
+            )
+    for name, param in fsdp_model.module.named_parameters():
+        if name not in state_dict:
+            state_dict[name] = param.data
+    return state_dict
 
 class ShardedOptimizer(Optimizer):
     def __init__(self, params, optimizer_cls: type[Optimizer], **kwargs: Any) -> None:
