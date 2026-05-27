@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
+import torch.distributed as dist
 
 
 
@@ -32,6 +34,24 @@ def get_flashattention_autograd_function_triton() -> type:
     # For example: return MyTritonFlashAttentionAutogradFunctionClass
     raise NotImplementedError
 
+class DDP(nn.Module):
+    def __init__(self, module: nn.Module):
+        super().__init__()
+        self.module = module
+        for param in module.parameters():
+            dist.broadcast(param.data, src=0)
+
+        for param in module.parameters():
+            if param.requires_grad:
+                param.register_post_accumulate_grad_hook(self._sync_grad)
+
+    def _sync_grad(self, param):
+        sz = dist.get_world_size()
+        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+        param.grad /= sz
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
 
 def get_ddp(module: torch.nn.Module) -> torch.nn.Module:
     """
@@ -50,8 +70,7 @@ def get_ddp(module: torch.nn.Module) -> torch.nn.Module:
     Returns:
         Instance of a DDP class.
     """
-    # For example: return DDP(module)
-    raise NotImplementedError
+    return DDP(module)
 
 
 def ddp_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -66,7 +85,7 @@ def ddp_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Opt
             Optimizer being used with the DDP-wrapped model.
     """
     # For example: ddp_model.finish_gradient_synchronization()
-    raise NotImplementedError
+    pass
 
 
 def get_fsdp(module: torch.nn.Module, compute_dtype: torch.dtype | None = None) -> torch.nn.Module:
